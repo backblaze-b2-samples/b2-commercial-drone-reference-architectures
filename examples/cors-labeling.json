@@ -1,0 +1,10 @@
+[
+  {
+    "corsRuleName": "labeling-tool-presigned-reads",
+    "allowedOrigins": ["https://label.example.com"],
+    "allowedOperations": ["s3_get", "s3_head"],
+    "allowedHeaders": ["range"],
+    "exposeHeaders": ["content-length", "content-range"],
+    "maxAgeSeconds": 3600
+  }
+]

@@ -1,0 +1,19 @@
+{
+  "bucketId": "<products-bucket-id>",
+  "eventNotificationRules": [
+    {
+      "name": "run-complete",
+      "eventTypes": [
+        "b2:ObjectCreated:Upload"
+      ],
+      "objectNamePrefix": "products/",
+      "isEnabled": true,
+      "maxEventsPerBatch": 1,
+      "targetConfiguration": {
+        "targetType": "webhook",
+        "url": "https://hooks.example.com/b2/runs",
+        "hmacSha256SigningSecret": "<32-char-alphanumeric-secret>"
+      }
+    }
+  ]
+}

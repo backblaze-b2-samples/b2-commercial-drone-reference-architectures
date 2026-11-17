@@ -1,0 +1,4 @@
+[
+  {"fileNamePrefix": "curation/", "daysFromUploadingToHiding": 60, "daysFromHidingToDeleting": 7, "daysFromStartingToCancelingUnfinishedLargeFiles": 7},
+  {"fileNamePrefix": "labels/", "daysFromUploadingToHiding": null, "daysFromHidingToDeleting": 30, "daysFromStartingToCancelingUnfinishedLargeFiles": 7}
+]

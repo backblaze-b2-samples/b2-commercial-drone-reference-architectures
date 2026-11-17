@@ -1,0 +1,10 @@
+[
+  {
+    "corsRuleName": "map-and-3d-viewers",
+    "allowedOrigins": ["https://maps.example.com"],
+    "allowedOperations": ["s3_get", "s3_head"],
+    "allowedHeaders": ["range", "authorization"],
+    "exposeHeaders": ["content-length", "content-range", "etag"],
+    "maxAgeSeconds": 3600
+  }
+]

@@ -1,0 +1,87 @@
+# B2 Reference Architectures for Commercial Drones
+
+> Reference architectures, third-party integrations, and B2 sample applications for flight capture offload, photogrammetry, cloud-optimized map and 3D delivery, AI inspection, and inspection training data with Backblaze B2.
+
+Canonical Backblaze product documentation: https://www.backblaze.com/docs/cloud-storage. Use this index to select an architecture, integration configuration, or sample application.
+
+## Start here
+
+- [Commercial drone summary](docs/commercial-drones.md): Concise workload, B2 fit, capabilities, and boundaries.
+- [Architecture index](docs/architecture-index.md): Human-readable index generated from the catalog.
+- [Machine-readable catalog](catalog/architectures.yaml): Audiences, workflows, capabilities, integrations, security, and compliance.
+- [Full text](llms-full.txt): Summary and every architecture in one file.
+
+## Architectures
+
+- [Offload flight captures into a per-mission archive and trigger processing](architectures/flight-capture-offload/architecture.md): After each flight, a field laptop, ground station or relay uploads stills, video, telemetry, flight logs and RTK/PPK files into a write-once per-mission prefix, writes manifest.json last, and a prefix-scoped B2 Event Notification starts downstream processing.
+- [Reconstruct orthomosaics, elevation models, point clouds and meshes from mission imagery](architectures/photogrammetry-processing/architecture.md): Stateless CPU/GPU workers pull a mission's raw images from B2, run SfM/MVS with OpenDroneMap NodeODM or COLMAP on local NVMe scratch, and write orthomosaic, DSM/DTM, LAZ point cloud, textured mesh and quality report to an immutable per-run prefix.
+- [Serve orthomosaics and elevation models as cloud-optimized map layers](architectures/cog-map-serving/architecture.md): Orthomosaics, DEMs and index maps such as NDVI are converted to Cloud-Optimized GeoTIFFs in `cog/<mission-id>/` and read in place by TiTiler, QGIS, ArcGIS Pro, GeoServer and rasterio through HTTP range requests, with CDN or presigned client delivery and no stored tile pyramid.
+- [Convert point clouds and meshes into streamable 3D datasets for web viewers](architectures/point-cloud-3d-streaming/architecture.md): PDAL and Entwine clean, classify and convert photogrammetric and drone-LiDAR point clouds to COPC or EPT on B2 through s3:// paths, meshes and Gaussian splats for site digital twins are versioned alongside, and browser viewers stream them by range request from a public bucket or CDN.
+- [Detect and geolocate defects in inspection imagery and video](architectures/ai-inspection-detection/architecture.md): YOLO or Roboflow Inference models scan inspection video and stills of towers, lines, solar farms, blades, bridges and roofs; geotagged detections, annotated keyframes, GeoJSON and Parquet roll-ups land in `inspections/<asset-id>/<inspection-id>/<model-version>/` and DuckDB queries them in place.
+- [Label inspection frames and publish versioned defect-detection datasets](architectures/inspection-training-data/architecture.md): Flagged frames and orthomosaic chips are deduplicated, pre-labeled with SAM 2 or labeled in CVAT or Label Studio directly against B2, and exported as immutable dataset versions under `datasets/<name>/<version>/` next to versioned model checkpoints.
+
+## Third-party integrations
+
+- [rclone](https://rclone.org/b2/): Built-in Backblaze B2 option. Configure the native `b2` backend with an application key ID and key scoped to the crew's prefix (write and list); `rclone copy` resumes, skips files already in B2 and verifies SHA-1 on upload. The S3 backend with provider Other and endpoint `https://s3.<region>.backblazeb2.com` also works ([setup guide](https://www.backblaze.com/docs/cloud-storage-integrate-rclone-with-backblaze-b2)). Architectures: architectures/flight-capture-offload/architecture.md, architectures/photogrammetry-processing/architecture.md
+- [AWS SDK for Python (boto3)](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/core/session.html): S3 custom endpoint. Set endpoint_url to `https://s3.<region>.backblazeb2.com` derived from B2_REGION, and set request_checksum_calculation and response_checksum_validation to `when_required` in botocore Config; worker code uses boto3 to read frames and write inference results for Ultralytics and Roboflow ([setup guide](https://www.backblaze.com/docs/cloud-storage-use-the-aws-sdk-for-python-with-backblaze-b2)). Architectures: architectures/flight-capture-offload/architecture.md, architectures/photogrammetry-processing/architecture.md, architectures/ai-inspection-detection/architecture.md
+- [OpenDroneMap NodeODM](https://github.com/OpenDroneMap/NodeODM): S3 custom endpoint. Start NodeODM with --s3_endpoint `s3.<region>.backblazeb2.com`, a dedicated client staging bucket, --s3_upload_everything and --s3_acl none; supply credentials through AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. The staging key has no name prefix because startup writes root test.txt and results use task-ID paths ([setup guide](https://github.com/OpenDroneMap/NodeODM/blob/master/config.js)). Architectures: architectures/photogrammetry-processing/architecture.md
+- [GDAL /vsis3/](https://gdal.org/en/stable/user/virtual_file_systems.html): S3 custom endpoint. Set `AWS_S3_ENDPOINT=s3.<region>.backblazeb2.com` (host only), AWS_REGION, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY; set AWS_VIRTUAL_HOSTING=FALSE for bucket names that contain dots ([setup guide](https://gdal.org/en/stable/user/virtual_file_systems.html#vsis3-aws-s3-files)). Architectures: architectures/cog-map-serving/architecture.md
+- [Rasterio / rio-cogeo](https://github.com/rasterio/rasterio): S3 custom endpoint. Pass rasterio.session.AWSSession(endpoint_url="s3.<region>.backblazeb2.com") to rasterio.Env, or set GDAL's AWS_S3_ENDPOINT; rio cogeo create writes COGs straight to /vsis3/ paths ([setup guide](https://github.com/rasterio/rasterio/blob/main/rasterio/session.py)). Architectures: architectures/cog-map-serving/architecture.md
+- [TiTiler](https://github.com/developmentseed/titiler): S3 custom endpoint. Set GDAL's AWS_S3_ENDPOINT, AWS_REGION and a read-only key in the TiTiler container environment; TiTiler reads COGs through GDAL /vsis3/ ([setup guide](https://github.com/backblaze-b2-samples/titiler-cog-map-tiles)). Architectures: architectures/cog-map-serving/architecture.md
+- [QGIS](https://qgis.org): S3 custom endpoint. Add a raster layer with protocol type AWS S3 and set AWS_S3_ENDPOINT in its credential options, or set the GDAL AWS variables globally under Settings > Options > Variables ([setup guide](https://docs.qgis.org/latest/en/docs/user_manual/managing_data_source/opening_data.html)). Architectures: architectures/cog-map-serving/architecture.md
+- [Esri ArcGIS Pro (cloud storage connection file)](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/create-cloud-storage-connection-file.html): S3 custom endpoint. Run Create Cloud Storage Connection File with service provider Amazon, the bucket name, a read-only key and Service End Point `s3.<region>.backblazeb2.com`; Esri documents the custom endpoint for S3-compatible storage. Architectures: architectures/cog-map-serving/architecture.md
+- [GeoServer COG community module](https://docs-archive.geoserver.org/stable/en/user/community/cog/cog.html): S3 custom endpoint. Set IIO_<SCHEME>_AWS_ENDPOINT to `https://s3.<region>.backblazeb2.com`, where <SCHEME> matches the layer URL (S3 for s3://, HTTPS for https://), plus _AWS_USER, _AWS_PASSWORD and _AWS_REGION; install the COG community module. Architectures: architectures/cog-map-serving/architecture.md
+- [Cloudflare CDN and Workers](https://www.backblaze.com/docs/cloud-storage-cloudflare-integrations): CDN origin. Point Cloudflare at the B2 bucket as origin; for private buckets, deploy a Worker that signs S3 requests with a scoped read-only key and passes range requests through ([setup guide](https://github.com/backblaze-b2-samples/cloudflare-b2)). Architectures: architectures/cog-map-serving/architecture.md, architectures/point-cloud-3d-streaming/architecture.md
+- [PDAL](https://pdal.io): S3 custom endpoint. Set AWS_ENDPOINT_URL=`s3.<region>.backblazeb2.com` (host only; Arbiter prepends https://) or an endpoint key in Arbiter's JSON config; PDAL then reads and writes s3:// paths ([setup guide](https://github.com/PDAL/PDAL/blob/master/vendor/arbiter/arbiter.cpp)). Architectures: architectures/point-cloud-3d-streaming/architecture.md
+- [Entwine](https://github.com/connormanning/entwine): S3 custom endpoint. Set AWS_ENDPOINT_URL=`s3.<region>.backblazeb2.com` (host only, no scheme); Entwine reads and writes s3:// paths through Arbiter ([setup guide](https://github.com/connormanning/arbiter/blob/master/arbiter/drivers/s3.cpp)). Architectures: architectures/point-cloud-3d-streaming/architecture.md
+- [DuckDB httpfs](https://duckdb.org/docs/current/core_extensions/httpfs/s3api.html): S3 custom endpoint. CREATE SECRET of TYPE s3 with ENDPOINT `s3.<region>.backblazeb2.com`, REGION and a scoped key; DuckDB reads Parquet row groups by range and writes results back with COPY. Architectures: architectures/ai-inspection-detection/architecture.md
+- [CVAT](https://docs.cvat.ai/docs/workspace/attach-cloud-storage/): S3 custom endpoint. Attach cloud storage with provider Amazon S3, key ID and secret access key pair, and Endpoint URL `https://s3.<region>.backblazeb2.com`, as in CVAT's Backblaze B2 guide ([setup guide](https://docs.cvat.ai/docs/workspace/attach-cloud-storage/#attach-backblaze-b2-storage)). Architectures: architectures/inspection-training-data/architecture.md
+- [Label Studio](https://labelstud.io/guide/storage_s3): S3 custom endpoint. Set the S3 Endpoint field on source and target storage to `https://s3.<region>.backblazeb2.com`; serve media by presigned URLs (configure bucket CORS) or proxy it through Label Studio. Architectures: architectures/inspection-training-data/architecture.md
+
+## Sample applications: closest workflow matches
+
+- [OpenDroneMap Photogrammetry Pipeline](https://github.com/backblaze-b2-samples/opendronemap-photogrammetry-pipeline): Presigned-PUT drone photo upload, local NodeODM reconstruction, and managed multipart write-back of orthomosaic, DEM, point cloud and mesh.
+- [YOLO Drone Footage Detection](https://github.com/backblaze-b2-samples/yolo-drone-footage-detection): Multipart video ingest, Ultralytics YOLO keyframe detection, GPX/SRT geotagging and a GeoJSON track on B2.
+- [TiTiler COG Map Tiles](https://github.com/backblaze-b2-samples/titiler-cog-map-tiles): GeoTIFF-to-COG conversion and dynamic XYZ tiles through GDAL /vsis3/ range reads with no stored tile copy.
+- [Roboflow Inference Frame Archive](https://github.com/backblaze-b2-samples/roboflow-inference-frame-archive): Edge inference that archives only flagged frames and prediction JSON, with hourly Parquet roll-ups.
+- [YOLO11 Batch Detection Pipeline](https://github.com/backblaze-b2-samples/yolo11-batch-detection-pipeline): Batch detection and segmentation over a B2 image and video library, writing COCO JSON, annotated frames and crops.
+- [Open3D Point Cloud Pipeline](https://github.com/backblaze-b2-samples/open3d-point-cloud-pipeline): PLY/PCD/LAS/LAZ ingest, downsampling, registration and meshing with a job manifest on B2.
+- [COLMAP Photogrammetry Archive](https://github.com/backblaze-b2-samples/colmap-photogrammetry-archive): pycolmap SfM that archives photos, database, sparse model and point cloud per project, served by presigned URL.
+- [COLMAP Gaussian Splatting Pipeline](https://github.com/backblaze-b2-samples/colmap-gaussian-splatting-pipeline): Photos or video to a COLMAP reconstruction and a Nerfstudio/gsplat-ready bundle versioned on B2.
+
+## Sample applications: operational building blocks
+
+- [SAM 2 Mask Dataset Builder](https://github.com/backblaze-b2-samples/sam2-mask-dataset-builder): Versioned segmentation datasets built from a raw B2 media archive with local SAM 2.
+- [fastdup Dataset Cleaning](https://github.com/backblaze-b2-samples/fastdup-dataset-cleaning): Duplicate, outlier and corrupt-file detection with quality reports and quarantine without deleting originals.
+- [DuckDB Query In Place](https://github.com/backblaze-b2-samples/duckdb-query-in-place): SQL over Parquet, CSV and JSON in B2 through DuckDB httpfs, materializing results back as Parquet.
+- [B2 Event Broker](https://github.com/backblaze-b2-samples/b2-event-broker): Cloudflare Worker that validates signed B2 Event Notifications and fans them out to subscribers.
+- [cloudflare-b2 (private bucket via Worker)](https://github.com/backblaze-b2-samples/cloudflare-b2): Cloudflare Worker that signs range requests to a private B2 bucket for CDN delivery.
+- [B2 Browser Upload](https://github.com/backblaze-b2-samples/b2-browser-upload): Browser-direct upload by S3 presigned PUT or b2_upload_file through a Node.js back end (5 GB single-upload cap).
+
+## Sample applications: domain-specific candidates
+
+- [IfcOpenShell BIM Archive](https://github.com/backblaze-b2-samples/ifcopenshell-bim-archive): IFC models, meshes and reports per project with manifests, served by presigned URL.
+
+## Schemas and configuration
+
+- [Architecture catalog schema](schemas/architecture-catalog.schema.json): JSON Schema for catalog/architectures.yaml.
+- [B2 configuration examples](examples/README.md): CORS, lifecycle, Object Lock, event notifications, and scoped keys.
+- [Related B2 sample applications](docs/related-b2-samples.md): Sample-to-architecture mapping and selection guidance.
+
+## Official product documentation
+
+- [Backblaze B2 documentation](https://www.backblaze.com/docs/cloud-storage): Current product behavior and setup.
+- [Backblaze B2 pricing](https://www.backblaze.com/cloud-storage/pricing): Current pricing and egress terms.
+
+## Other B2 reference architecture categories
+
+- [AI Data Providers](https://github.com/backblaze-b2-samples/b2-ai-data-provider-reference-architectures)
+- [Generative Video](https://github.com/backblaze-b2-samples/b2-gen-video-reference-architectures)
+- [Image Generation](https://github.com/backblaze-b2-samples/b2-image-generation-reference-architectures)
+- [Robotics](https://github.com/backblaze-b2-samples/b2-robotics-reference-architectures)
+- [Autonomous Vehicles](https://github.com/backblaze-b2-samples/b2-autonomous-vehicle-reference-architectures)
+
+## Optional
+
+- [Repository agent guide](AGENTS.md): Source hierarchy, generation commands, and operational invariants.
+- [Portable agent skill](skill/SKILL.md): Self-contained guidance for B2 commercial drone data architecture work.

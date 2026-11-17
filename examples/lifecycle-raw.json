@@ -1,0 +1,4 @@
+[
+  {"fileNamePrefix": "raw/", "daysFromUploadingToHiding": null, "daysFromHidingToDeleting": null, "daysFromStartingToCancelingUnfinishedLargeFiles": 7},
+  {"fileNamePrefix": "staging/", "daysFromUploadingToHiding": 14, "daysFromHidingToDeleting": 1, "daysFromStartingToCancelingUnfinishedLargeFiles": 7}
+]

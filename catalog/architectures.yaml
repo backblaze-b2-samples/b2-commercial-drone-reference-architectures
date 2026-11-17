@@ -1,0 +1,510 @@
+schema_version: 2.0.0
+updated: "2026-11-16"
+canonical_documentation: https://www.backblaze.com/docs/cloud-storage
+related_categories:
+  - name: AI Data Providers
+    url: https://github.com/backblaze-b2-samples/b2-ai-data-provider-reference-architectures
+  - name: Generative Video
+    url: https://github.com/backblaze-b2-samples/b2-gen-video-reference-architectures
+  - name: Image Generation
+    url: https://github.com/backblaze-b2-samples/b2-image-generation-reference-architectures
+  - name: Robotics
+    url: https://github.com/backblaze-b2-samples/b2-robotics-reference-architectures
+  - name: Autonomous Vehicles
+    url: https://github.com/backblaze-b2-samples/b2-autonomous-vehicle-reference-architectures
+architectures:
+  - id: flight-capture-offload
+    name: Offload flight captures into a per-mission archive and trigger processing
+    slug: flight-capture-offload
+    summary: After each flight, a field laptop, ground station or relay uploads stills, video, telemetry, flight logs and RTK/PPK files into a write-once per-mission prefix, writes manifest.json last, and a prefix-scoped B2 Event Notification starts downstream processing.
+    audience:
+      - Drone program and field operations leads
+      - Survey, inspection and mapping data engineers
+      - Security and records owners
+    problem: Drone teams collect data on SD cards spread across field crews and docks. They need a resumable, verifiable offload into one durable place, with chain of custody and a reliable processing trigger, without running a file server.
+    workflow:
+      - rclone copy (native B2 backend, checksum verified) moves SD-card or staging folders into `raw/<client>/<site>/<mission-id>/`; a browser field portal can upload stills with presigned PUT URLs
+      - Multi-GB video uses multipart upload, because a single PUT is capped at 5 GB
+      - The uploader writes manifest.json last with mission, site, aircraft, camera, CRS and a file list with client-computed hashes
+      - A B2 Event Notification rule on the raw/ prefix posts to an event broker, which ignores everything except */manifest.json before enqueuing jobs
+      - A lifecycle rule cancels unfinished large-file uploads; raw captures are never moved or tiered
+      - Object Lock retention or a legal hold protects raw captures kept as evidence
+      - Vendor-cloud fleets (DJI Dock, FlightHub) land in the vendor cloud first; an rclone relay copies them to B2
+    capabilities:
+      - S3-compatible API with a regional endpoint
+      - Presigned PUT URLs for field and browser uploads (5 GB single-PUT limit)
+      - Multipart upload for multi-GB video
+      - Event Notifications (prefix-filtered, optional signing secret, enabled through Backblaze Support)
+      - Object Lock (governance or compliance) and legal hold
+      - Lifecycle rule to cancel unfinished large-file uploads
+      - Application keys scoped to one bucket and name prefix with write and list capabilities per field crew; no object reads or permanent version deletion
+    integrations:
+      # Shared with photogrammetry-processing through the YAML alias below.
+      - &rclone
+        id: rclone
+        name: rclone
+        role: Resumable, checksum-verified field offload and staging of inputs and exported products for desktop photogrammetry tools without S3 support
+        connection: Configure the native `b2` backend with an application key ID and key scoped to the crew's prefix (write and list); `rclone copy` resumes, skips files already in B2 and verifies SHA-1 on upload. The S3 backend with provider Other and endpoint `https://s3.<region>.backblazeb2.com` also works
+        connection_type: native-b2-option
+        url: https://rclone.org/b2/
+        setup_url: https://www.backblaze.com/docs/cloud-storage-integrate-rclone-with-backblaze-b2
+      # Shared with ai-inspection-detection through the YAML alias below.
+      - &boto3
+        id: boto3
+        name: AWS SDK for Python (boto3)
+        role: Presigned PUT/GET URLs, managed multipart upload and pipeline I/O in custom field portals and inference workers
+        connection: Set endpoint_url to `https://s3.<region>.backblazeb2.com` derived from B2_REGION, and set request_checksum_calculation and response_checksum_validation to `when_required` in botocore Config; worker code uses boto3 to read frames and write inference results for Ultralytics and Roboflow
+        connection_type: s3-custom-endpoint
+        url: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/core/session.html
+        setup_url: https://www.backblaze.com/docs/cloud-storage-use-the-aws-sdk-for-python-with-backblaze-b2
+    prerequisites:
+      - A private B2 bucket for raw captures, created with Object Lock enabled if captures are evidentiary
+      - Write-only, prefix-scoped application keys per field crew or relay; no master key in the field
+      - Event Notifications enabled on the account through Backblaze Support, and an HTTPS event receiver
+      - A mission registry (for example Postgres/PostGIS) that owns mission ids
+    expected_scale:
+      profile: Bursty uploads after each flight, sized from image count, video bitrate and duration, and telemetry frequency
+      notes: Standard B2 is the default; offload speed is usually bounded by the field uplink. Use rclone or SDK multipart concurrency for large video.
+    security_considerations:
+      - Field crews hold write-plus-list keys scoped to `raw/<client>/`, without object reads or permanent version deletion; writeFiles still permits hiding or creating a new version of an existing key
+      - For strict append-only field access, use a trusted upload relay that allocates new authorized keys and refuses replacements; presigned PUTs can be replayed until expiry, and Object Lock protects versions without preventing hiding or a new current version
+      - Verify signed event POSTs when a signing secret is configured, and keep the receiver idempotent
+      - Keep bucket, lifecycle and Object Lock administration keys out of field devices
+      - This design uses scoped application keys for relay uploads; vendor-cloud exports are staged in the relay tier
+    compliance_considerations:
+      - Captures can include people, vehicles and private property; set retention and access before collection
+      - Use governance-mode Object Lock by default; choose compliance mode only for a contractual or regulatory requirement
+      - Keep client-computed hashes in manifest.json for chain of custody
+    links:
+      architecture: architectures/flight-capture-offload/architecture.md
+      deployment: https://www.backblaze.com/docs/cloud-storage-integrate-rclone-with-backblaze-b2
+
+  - id: photogrammetry-processing
+    name: Reconstruct orthomosaics, elevation models, point clouds and meshes from mission imagery
+    slug: photogrammetry-processing
+    summary: Stateless CPU/GPU workers pull a mission's raw images from B2, run SfM/MVS with OpenDroneMap NodeODM or COLMAP on local NVMe scratch, and write orthomosaic, DSM/DTM, LAZ point cloud, textured mesh and quality report to an immutable per-run prefix.
+    audience:
+      - Photogrammetry and GIS processing engineers
+      - Survey and construction technology teams
+      - Platform engineers running GPU or CPU batch compute
+    problem: Teams reprocess missions when parameters or software change. They need inputs and every run's outputs kept side by side without a shared filesystem tying compute to storage.
+    workflow:
+      - An event or an operator triggers a job for `raw/<client>/<site>/<mission-id>/`
+      - The worker downloads images to local NVMe scratch and submits them to NodeODM (pyodm) or runs pycolmap
+      - NodeODM uploads task-ID results to a dedicated client staging bucket with no key-prefix restriction; the publisher reads staging and writes the versioned products/ layout
+      - Or the worker writes outputs with boto3 managed multipart to `products/<mission-id>/<run-id>/`
+      - A run manifest.json records software versions, parameters, the input manifest hash and output keys; new run ids keep earlier runs immutable
+      - Desktop tools without S3 support (Agisoft Metashape, PIX4Dmatic) are staged with rclone into the same layout
+      - The run manifest landing triggers COG conversion, point cloud tiling and AI inspection
+    capabilities:
+      - S3-compatible API with a regional endpoint
+      - Multipart upload for multi-GB GeoTIFF, LAZ and mesh outputs
+      - Per-run immutable prefixes with manifests (B2-side pattern)
+      - Lifecycle rules to expire superseded runs or staging prefixes
+      - Event Notifications to chain downstream jobs
+      - Scoped application keys (read raw/, write products/)
+    integrations:
+      - id: nodeodm
+        name: OpenDroneMap NodeODM
+        role: Photogrammetry processing node producing orthophoto, DEM, point cloud and textured mesh
+        connection: Start NodeODM with --s3_endpoint `s3.<region>.backblazeb2.com`, a dedicated client staging bucket, --s3_upload_everything and --s3_acl none; supply credentials through AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. The staging key has no name prefix because startup writes root test.txt and results use task-ID paths
+        connection_type: s3-custom-endpoint
+        url: https://github.com/OpenDroneMap/NodeODM
+        setup_url: https://github.com/OpenDroneMap/NodeODM/blob/master/config.js
+      # COLMAP has no storage layer; workers stage its inputs and outputs with boto3 or rclone.
+      - *boto3
+      - *rclone
+    prerequisites:
+      - Raw captures and manifests laid out as in flight-capture-offload
+      - CPU or GPU workers with local NVMe scratch sized for the largest mission
+      - A read-only key on raw/<client>/, a NodeODM key for its dedicated staging bucket, and separate publisher keys to read staging and write products/
+      - A job queue and NodeODM/WebODM task state outside B2
+    expected_scale:
+      profile: Storage and scratch requirements depend on the image set, output formats, and reconstruction settings
+      notes: Standard B2 is the default; workers are compute-bound. Keep SfM scratch on local NVMe and upload only finished products.
+    security_considerations:
+      - Never leave NodeODM's default public-read ACL in place; pass --s3_acl none
+      - Processing reads only raw/<client>/; NodeODM writes its dedicated staging bucket, and a separate publisher reads staging and writes products/ without deleting raw captures
+      - Run manifests record input hashes so each product traces to its source captures
+    compliance_considerations:
+      - Client survey products may be contractually confidential; keep buckets private and deliver by presigned URL or signed CDN
+      - Retain run manifests with the products they describe
+    links:
+      architecture: architectures/photogrammetry-processing/architecture.md
+      deployment: https://github.com/OpenDroneMap/NodeODM
+
+  - id: cog-map-serving
+    name: Serve orthomosaics and elevation models as cloud-optimized map layers
+    slug: cog-map-serving
+    summary: Orthomosaics, DEMs and index maps such as NDVI are converted to Cloud-Optimized GeoTIFFs in `cog/<mission-id>/` and read in place by TiTiler, QGIS, ArcGIS Pro, GeoServer and rasterio through HTTP range requests, with CDN or presigned client delivery and no stored tile pyramid.
+    audience:
+      - GIS and web-mapping engineers
+      - Survey, agriculture and construction analytics teams
+      - Client-delivery and platform engineers
+    problem: Clients and analysts need to view and analyze multi-GB orthomosaics and DEMs without downloading them, and providers do not want to pre-render and store a second XYZ tile copy of every mission.
+    workflow:
+      - A conversion job reads `products/<mission-id>/<run-id>/orthophoto.tif` and writes a COG with internal overviews to `cog/<mission-id>/<product>.tif` through GDAL /vsis3/ (rio-cogeo or gdal_translate -of COG)
+      - TiTiler renders XYZ/WMTS tiles on demand from range GETs and accepts only validated layer ids, never raw URLs
+      - QGIS, ArcGIS Pro and GeoServer open the same objects in place
+      - Optional analytics jobs read only needed windows and write masks and GeoJSON to `analysis/<mission-id>/`
+      - Public basemaps go through Cloudflare with B2 as origin; private deliverables go out as presigned GETs or through a signing Worker
+    capabilities:
+      - S3-compatible API with HTTP range GETs
+      - Presigned GET URLs for time-limited client delivery
+      - CORS rules for browser map clients
+      - CDN origin (Cloudflare partnership; see pricing for egress terms through partner CDNs)
+      - Scoped read-only application keys per consumer
+      - Included egress (see B2 pricing for current terms)
+    integrations:
+      - id: gdal-vsis3
+        name: GDAL /vsis3/
+        role: Range-read and write raster access underlying COG conversion, TiTiler, QGIS and rasterio
+        connection: Set `AWS_S3_ENDPOINT=s3.<region>.backblazeb2.com` (host only), AWS_REGION, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY; set AWS_VIRTUAL_HOSTING=FALSE for bucket names that contain dots
+        connection_type: s3-custom-endpoint
+        url: https://gdal.org/en/stable/user/virtual_file_systems.html
+        setup_url: https://gdal.org/en/stable/user/virtual_file_systems.html#vsis3-aws-s3-files
+      - id: rasterio
+        name: Rasterio / rio-cogeo
+        role: Python raster I/O and COG creation
+        connection: Pass rasterio.session.AWSSession(endpoint_url="s3.<region>.backblazeb2.com") to rasterio.Env, or set GDAL's AWS_S3_ENDPOINT; rio cogeo create writes COGs straight to /vsis3/ paths
+        connection_type: s3-custom-endpoint
+        url: https://github.com/rasterio/rasterio
+        setup_url: https://github.com/rasterio/rasterio/blob/main/rasterio/session.py
+      - id: titiler
+        name: TiTiler
+        role: Dynamic XYZ/WMTS tile server over COGs
+        connection: Set GDAL's AWS_S3_ENDPOINT, AWS_REGION and a read-only key in the TiTiler container environment; TiTiler reads COGs through GDAL /vsis3/
+        connection_type: s3-custom-endpoint
+        url: https://github.com/developmentseed/titiler
+        setup_url: https://github.com/backblaze-b2-samples/titiler-cog-map-tiles
+      - id: qgis
+        name: QGIS
+        role: Desktop GIS viewing and analysis of COGs in place
+        connection: Add a raster layer with protocol type AWS S3 and set AWS_S3_ENDPOINT in its credential options, or set the GDAL AWS variables globally under Settings > Options > Variables
+        connection_type: s3-custom-endpoint
+        url: https://qgis.org
+        setup_url: https://docs.qgis.org/latest/en/docs/user_manual/managing_data_source/opening_data.html
+      - id: arcgis-pro
+        name: Esri ArcGIS Pro (cloud storage connection file)
+        role: Desktop GIS access to rasters in object storage
+        connection: Run Create Cloud Storage Connection File with service provider Amazon, the bucket name, a read-only key and Service End Point `s3.<region>.backblazeb2.com`; Esri documents the custom endpoint for S3-compatible storage
+        connection_type: s3-custom-endpoint
+        url: https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/create-cloud-storage-connection-file.html
+      - id: geoserver-cog
+        name: GeoServer COG community module
+        role: OGC WMS/WMTS serving of COGs
+        connection: Set IIO_<SCHEME>_AWS_ENDPOINT to `https://s3.<region>.backblazeb2.com`, where <SCHEME> matches the layer URL (S3 for s3://, HTTPS for https://), plus _AWS_USER, _AWS_PASSWORD and _AWS_REGION; install the COG community module
+        connection_type: s3-custom-endpoint
+        url: https://docs-archive.geoserver.org/stable/en/user/community/cog/cog.html
+      # Shared with point-cloud-3d-streaming through the YAML alias below.
+      - &cloudflare
+        id: cloudflare
+        name: Cloudflare CDN and Workers
+        role: Edge cache and request signing for public or private map and 3D tile delivery
+        connection: Point Cloudflare at the B2 bucket as origin; for private buckets, deploy a Worker that signs S3 requests with a scoped read-only key and passes range requests through
+        connection_type: cdn-origin
+        url: https://www.backblaze.com/docs/cloud-storage-cloudflare-integrations
+        setup_url: https://github.com/backblaze-b2-samples/cloudflare-b2
+    prerequisites:
+      - Photogrammetry products laid out as in photogrammetry-processing
+      - Read-only keys scoped to cog/ for each tile server, GIS user group or Worker
+      - CORS rules for any browser origin that reads presigned COG URLs
+      - A layer registry mapping layer ids to object keys
+    expected_scale:
+      profile: Few large COGs per mission with many small concurrent range reads from viewers and tile servers
+      notes: Standard B2 behind a CDN or tile cache is the default; tile caches absorb repeated reads. Measure sustained origin read rates before considering Overdrive.
+    security_considerations:
+      - Tile servers accept validated layer ids, never arbitrary URLs, to avoid server-side request forgery
+      - Each consumer gets a read-only key scoped to cog/ or a narrower prefix
+      - Treat presigned COG URLs as bearer credentials with short TTLs
+      - Private buckets behind a CDN use a signing Worker; do not make the bucket public to enable caching
+    compliance_considerations:
+      - Orthomosaics can show people, vehicles and private property at high resolution; restrict public basemaps to cleared imagery
+      - Record which mission and run each published layer came from
+    links:
+      architecture: architectures/cog-map-serving/architecture.md
+      deployment: https://github.com/backblaze-b2-samples/titiler-cog-map-tiles
+
+  - id: point-cloud-3d-streaming
+    name: Convert point clouds and meshes into streamable 3D datasets for web viewers
+    slug: point-cloud-3d-streaming
+    summary: PDAL and Entwine clean, classify and convert photogrammetric and drone-LiDAR point clouds to COPC or EPT on B2 through s3:// paths, meshes and Gaussian splats for site digital twins are versioned alongside, and browser viewers stream them by range request from a public bucket or CDN.
+    audience:
+      - LiDAR and 3D data engineers
+      - Construction, mining and corridor digital-twin teams
+      - Web 3D viewer developers
+    problem: Site and corridor point clouds are too large for clients to download. Teams need range-readable versions next to the source data for digital twins, volume measurement and construction progress.
+    workflow:
+      - Source LAS/LAZ from NodeODM or a LiDAR payload lands in `pointcloud/<mission-id>/<run-id>/raw/`
+      - A PDAL pipeline filters, classifies and reprojects, reading s3:// input and writing .copc.laz back through Arbiter with `AWS_ENDPOINT_URL=s3.<region>.backblazeb2.com` (host only; Arbiter prepends https://)
+      - For multi-flight or very large sites, Entwine builds an EPT index into `pointcloud/<site>/ept/` through the same Arbiter S3 driver
+      - Digital-twin jobs version camera poses, meshes and .ply splats under `twins/<site>/<capture-id>/`
+      - Viewers (Potree, CesiumJS, COPC viewers) fetch by HTTP URL from a public bucket with CORS or through a CDN or signing Worker
+      - Optionally, the twin is compared against IFC/BIM models to track construction progress
+    capabilities:
+      - S3-compatible API with HTTP range GETs
+      - CORS rules for browser viewers
+      - Public bucket or CDN origin for multi-file tilesets
+      - Multipart upload for multi-GB COPC/LAZ
+      - Per-run versioned prefixes with manifests (B2-side pattern)
+    integrations:
+      - id: pdal
+        name: PDAL
+        role: Point cloud filtering, classification, reprojection and COPC writing
+        connection: Set AWS_ENDPOINT_URL=`s3.<region>.backblazeb2.com` (host only; Arbiter prepends https://) or an endpoint key in Arbiter's JSON config; PDAL then reads and writes s3:// paths
+        connection_type: s3-custom-endpoint
+        url: https://pdal.io
+        setup_url: https://github.com/PDAL/PDAL/blob/master/vendor/arbiter/arbiter.cpp
+      - id: entwine
+        name: Entwine
+        role: EPT index builder for very large or multi-flight point clouds
+        connection: Set AWS_ENDPOINT_URL=`s3.<region>.backblazeb2.com` (host only, no scheme); Entwine reads and writes s3:// paths through Arbiter
+        connection_type: s3-custom-endpoint
+        url: https://github.com/connormanning/entwine
+        setup_url: https://github.com/connormanning/arbiter/blob/master/arbiter/drivers/s3.cpp
+      - *cloudflare
+    prerequisites:
+      - Point clouds from photogrammetry-processing or a LiDAR payload
+      - A key scoped to pointcloud/ and twins/ for processing jobs, and a separate read-only path for viewers
+      - CORS for viewer origins, or a CDN or Worker in front of a private bucket
+    expected_scale:
+      profile: Hundreds of MB to hundreds of GB per site, read by many small range requests from viewers
+      notes: Standard B2 behind a CDN is the default. Per-file presigned URLs are impractical for multi-file octrees; prefer a CDN or signing Worker.
+    security_considerations:
+      - Publish only cleared datasets to a public bucket; keep source clouds and twins private
+      - Use a signing Worker with a read-only key for private tilesets
+      - Processing keys cannot write outside pointcloud/ and twins/
+    compliance_considerations:
+      - Site scans can reveal security-sensitive infrastructure; classify before publishing
+      - Keep run manifests and source hashes with derived tilesets
+    links:
+      architecture: architectures/point-cloud-3d-streaming/architecture.md
+      deployment: https://pdal.io
+
+  - id: ai-inspection-detection
+    name: Detect and geolocate defects in inspection imagery and video
+    slug: ai-inspection-detection
+    summary: YOLO or Roboflow Inference models scan inspection video and stills of towers, lines, solar farms, blades, bridges and roofs; geotagged detections, annotated keyframes, GeoJSON and Parquet roll-ups land in `inspections/<asset-id>/<inspection-id>/<model-version>/` and DuckDB queries them in place.
+    audience:
+      - Energy, utility and infrastructure inspection teams
+      - Computer-vision and MLOps engineers
+      - Asset-management data engineers
+    problem: Each inspection video fans out into hundreds of derived objects across thousands of assets per season. Operators need results tied to source media and location, queryable fleet-wide, and reprocessable in batch when models improve.
+    workflow:
+      - Source video and SRT/GPX telemetry land in raw/ (see flight-capture-offload) and the manifest event enqueues an inference job
+      - The worker streams video from B2, samples keyframes, runs Ultralytics YOLO on a local GPU and extracts the GPS track from sidecar telemetry
+      - It writes annotated keyframes, per-frame detection JSON, summary.json and a GeoJSON track to `inspections/<asset-id>/<inspection-id>/<model-version>/`; the review UI reads them by presigned GET
+      - Edge variant - Roboflow Inference on a ground station or dock computer archives only flagged frames and prediction JSON, with hourly Parquet roll-ups under summaries/
+      - DuckDB httpfs with an S3 secret whose ENDPOINT is the B2 endpoint queries detection Parquet fleet-wide and writes slices back to `query-slices/` with COPY
+      - When a better model ships, a batch job reprocesses the archive under a new model-version prefix
+    capabilities:
+      - S3-compatible API with a regional endpoint
+      - Multipart streaming upload for large video
+      - Presigned GET for review UIs
+      - Event Notifications to trigger inference
+      - HTTP range reads for Parquet query in place
+      - Object Lock for evidentiary inspection records
+      - Write-only keys per edge device scoped to its prefix (`edge/<device>/`, `summaries/<device>/`)
+    integrations:
+      - *boto3
+      - id: duckdb-httpfs
+        name: DuckDB httpfs
+        role: SQL over detection Parquet in place and materialized result slices
+        connection: CREATE SECRET of TYPE s3 with ENDPOINT `s3.<region>.backblazeb2.com`, REGION and a scoped key; DuckDB reads Parquet row groups by range and writes results back with COPY
+        connection_type: s3-custom-endpoint
+        url: https://duckdb.org/docs/current/core_extensions/httpfs/s3api.html
+    prerequisites:
+      - Captures and manifests laid out as in flight-capture-offload
+      - GPU workers or edge computers for inference; model weights cached on local disk
+      - Write keys scoped to inspections/ (workers), detections/ (roll-up job), query-slices/ (DuckDB slice writer) or `edge/<device>/` and `summaries/<device>/` (edge devices); read-only keys for DuckDB analysts, one per prefix
+      - An asset registry and work-order system outside B2
+    expected_scale:
+      profile: Hundreds of derived objects per inspection across thousands of assets per season
+      notes: Standard B2 is the default. Parquet roll-ups keep fleet-wide queries to a few range reads instead of listing millions of JSON objects.
+    security_considerations:
+      - Edge devices hold write-only keys scoped to their own prefix, or receive presigned PUTs
+      - Review UIs get short-lived presigned GETs; analysts get read-only keys
+      - Reprocessing writes to a new model-version prefix and never overwrites earlier results
+    compliance_considerations:
+      - Inspection records may support regulatory or insurance claims; lock them with Object Lock where required
+      - Keep the model version and source manifest hash with every detection set
+    links:
+      architecture: architectures/ai-inspection-detection/architecture.md
+      deployment: https://github.com/backblaze-b2-samples/yolo-drone-footage-detection
+
+  - id: inspection-training-data
+    name: Label inspection frames and publish versioned defect-detection datasets
+    slug: inspection-training-data
+    summary: Flagged frames and orthomosaic chips are deduplicated, pre-labeled with SAM 2 or labeled in CVAT or Label Studio directly against B2, and exported as immutable dataset versions under `datasets/<name>/<version>/` next to versioned model checkpoints.
+    audience:
+      - Computer-vision data and labeling operations teams
+      - MLOps engineers training defect-detection models
+      - Security and storage architects
+    problem: Defect classes such as cracks, corrosion, vegetation encroachment and thermal hot spots are rare and site-specific, so teams continuously relabel and retrain. They need labeling tools that read media from the archive without copying it and reproducible dataset versions tied to model versions.
+    workflow:
+      - A curation job selects candidate frames from inspections/ and chips orthomosaic tiles; fastdup flags duplicates and outliers and quarantines them without deleting
+      - SAM 2 writes pre-labeled masks into a draft label prefix
+      - CVAT attaches B2 as Amazon S3 cloud storage with the B2 Endpoint URL, or Label Studio syncs source storage and writes annotations to target storage through its S3 Endpoint field
+      - Reviewed labels are exported as COCO/YOLO to `datasets/<name>/<version>/` with a manifest of source keys and hashes; versions are never overwritten
+      - Training workers cache shards on local NVMe, write checkpoints to `models/<name>/<version>/` and record the dataset version used
+      - New model versions feed batch reprocessing in ai-inspection-detection
+    capabilities:
+      - S3-compatible API with a regional endpoint
+      - Presigned GET URLs for labeling UIs
+      - CORS rules for browser annotation tools
+      - Immutable versioned dataset prefixes with manifests (B2-side pattern)
+      - Object Lock (optional) on released dataset versions
+      - Scoped keys per labeling tool (read media, write labels)
+    integrations:
+      - id: cvat
+        name: CVAT
+        role: Image and video annotation with task data read from and exports written to B2
+        connection: Attach cloud storage with provider Amazon S3, key ID and secret access key pair, and Endpoint URL `https://s3.<region>.backblazeb2.com`, as in CVAT's Backblaze B2 guide
+        connection_type: s3-custom-endpoint
+        url: https://docs.cvat.ai/docs/workspace/attach-cloud-storage/
+        setup_url: https://docs.cvat.ai/docs/workspace/attach-cloud-storage/#attach-backblaze-b2-storage
+      - id: label-studio
+        name: Label Studio
+        role: Annotation with S3 source storage for media and target storage for labels
+        connection: Set the S3 Endpoint field on source and target storage to `https://s3.<region>.backblazeb2.com`; serve media by presigned URLs (configure bucket CORS) or proxy it through Label Studio
+        connection_type: s3-custom-endpoint
+        url: https://labelstud.io/guide/storage_s3
+    prerequisites:
+      - Inspection outputs laid out as in ai-inspection-detection
+      - Separate keys for the labeling tool's source reads, label writes and dataset publishing
+      - CORS for the labeling tool's origin when browsers read presigned URLs
+      - CVAT or Label Studio databases on block storage, not B2
+    expected_scale:
+      profile: Thousands to millions of frames and chips per dataset version, read repeatedly during training
+      notes: Standard B2 is the default; cache shards on local NVMe for multi-epoch training. Consider Overdrive only for sustained multi-GPU reads where storage throughput is the measured bottleneck.
+    security_considerations:
+      - Labeling tools read media with list/read keys and write only to label prefixes
+      - Do not grant deleteFiles to labeling tools; quarantine instead of deleting
+      - Treat presigned media URLs as bearer credentials and restrict CORS to the tool's exact origin
+    compliance_considerations:
+      - Record the source keys and hashes for every dataset version
+      - Lock released dataset versions when customers or auditors need reproducibility
+    links:
+      architecture: architectures/inspection-training-data/architecture.md
+      deployment: https://docs.cvat.ai/docs/workspace/attach-cloud-storage/
+
+samples:
+  - id: opendronemap-photogrammetry-pipeline
+    name: OpenDroneMap Photogrammetry Pipeline
+    url: https://github.com/backblaze-b2-samples/opendronemap-photogrammetry-pipeline
+    group: workflow
+    summary: Presigned-PUT drone photo upload, local NodeODM reconstruction, and managed multipart write-back of orthomosaic, DEM, point cloud and mesh
+    description: Drone photos upload by presigned PUT into mission prefixes, a local NodeODM engine reconstructs them, and the orthomosaic, DEM, point cloud and mesh return to B2 with managed multipart upload; JSON mission manifests replace a database.
+    architectures: [flight-capture-offload, photogrammetry-processing]
+
+  - id: yolo-drone-footage-detection
+    name: YOLO Drone Footage Detection
+    url: https://github.com/backblaze-b2-samples/yolo-drone-footage-detection
+    group: workflow
+    summary: Multipart video ingest, Ultralytics YOLO keyframe detection, GPX/SRT geotagging and a GeoJSON track on B2
+    description: Drone video streams to B2 by multipart upload; Ultralytics YOLO runs on sampled keyframes, detections are geotagged from GPX/SRT telemetry, and annotated frames, per-frame JSON and a GeoJSON track are written back.
+    architectures: [ai-inspection-detection]
+
+  - id: titiler-cog-map-tiles
+    name: TiTiler COG Map Tiles
+    url: https://github.com/backblaze-b2-samples/titiler-cog-map-tiles
+    group: workflow
+    summary: GeoTIFF-to-COG conversion and dynamic XYZ tiles through GDAL /vsis3/ range reads with no stored tile copy
+    description: GeoTIFFs are converted to COGs in B2 and TiTiler serves dynamic XYZ tiles through GDAL /vsis3/ range reads, so no tile pyramid is stored.
+    architectures: [cog-map-serving]
+
+  - id: roboflow-inference-frame-archive
+    name: Roboflow Inference Frame Archive
+    url: https://github.com/backblaze-b2-samples/roboflow-inference-frame-archive
+    group: workflow
+    summary: Edge inference that archives only flagged frames and prediction JSON, with hourly Parquet roll-ups
+    description: Roboflow Inference runs locally and archives only flagged frames and prediction JSON to B2 with Parquet roll-ups; built around cameras, the same pattern fits a ground station or dock computer.
+    architectures: [ai-inspection-detection]
+
+  - id: yolo11-batch-detection-pipeline
+    name: YOLO11 Batch Detection Pipeline
+    url: https://github.com/backblaze-b2-samples/yolo11-batch-detection-pipeline
+    group: workflow
+    summary: Batch detection and segmentation over a B2 image and video library, writing COCO JSON, annotated frames and crops
+    description: Batch detection and segmentation runs over an image and video library in B2 and writes COCO JSON, annotated frames and crops back; used here for model-version reprocessing.
+    architectures: [ai-inspection-detection]
+
+  - id: open3d-point-cloud-pipeline
+    name: Open3D Point Cloud Pipeline
+    url: https://github.com/backblaze-b2-samples/open3d-point-cloud-pipeline
+    group: workflow
+    summary: PLY/PCD/LAS/LAZ ingest, downsampling, registration and meshing with a job manifest on B2
+    description: Point cloud scans are ingested, downsampled, registered and meshed, with artifacts and a job manifest written to B2; it complements PDAL and does not replace COPC/EPT conversion.
+    architectures: [point-cloud-3d-streaming]
+
+  - id: colmap-photogrammetry-archive
+    name: COLMAP Photogrammetry Archive
+    url: https://github.com/backblaze-b2-samples/colmap-photogrammetry-archive
+    group: workflow
+    summary: pycolmap SfM that archives photos, database, sparse model and point cloud per project, served by presigned URL
+    description: pycolmap structure-from-motion archives photos, the COLMAP database, sparse model and point cloud per project on B2 and serves them by presigned URL.
+    architectures: [photogrammetry-processing]
+
+  - id: colmap-gaussian-splatting-pipeline
+    name: COLMAP Gaussian Splatting Pipeline
+    url: https://github.com/backblaze-b2-samples/colmap-gaussian-splatting-pipeline
+    group: workflow
+    summary: Photos or video to a COLMAP reconstruction and a Nerfstudio/gsplat-ready bundle versioned on B2
+    description: Photos or video become a COLMAP reconstruction and a Nerfstudio/gsplat-ready bundle versioned on B2, a pattern for site digital twins.
+    architectures: [point-cloud-3d-streaming]
+
+  - id: sam2-mask-dataset-builder
+    name: SAM 2 Mask Dataset Builder
+    url: https://github.com/backblaze-b2-samples/sam2-mask-dataset-builder
+    group: building-block
+    summary: Versioned segmentation datasets built from a raw B2 media archive with local SAM 2
+    description: A raw image and video archive on B2 becomes a versioned segmentation dataset using local SAM 2, useful for pre-labeling defect masks.
+    architectures: [inspection-training-data]
+
+  - id: fastdup-dataset-cleaning
+    name: fastdup Dataset Cleaning
+    url: https://github.com/backblaze-b2-samples/fastdup-dataset-cleaning
+    group: building-block
+    summary: Duplicate, outlier and corrupt-file detection with quality reports and quarantine without deleting originals
+    description: Finds exact and near duplicates, outliers and corrupt files in B2 image datasets, writes quality reports, and quarantines flagged files without deleting originals.
+    architectures: [inspection-training-data]
+
+  - id: duckdb-query-in-place
+    name: DuckDB Query In Place
+    url: https://github.com/backblaze-b2-samples/duckdb-query-in-place
+    group: building-block
+    summary: SQL over Parquet, CSV and JSON in B2 through DuckDB httpfs, materializing results back as Parquet
+    description: DuckDB httpfs pointed at the B2 endpoint queries Parquet, CSV and JSON in place and materializes result slices back to B2 as Parquet.
+    architectures: [ai-inspection-detection]
+
+  - id: b2-event-broker
+    name: B2 Event Broker
+    url: https://github.com/backblaze-b2-samples/b2-event-broker
+    group: building-block
+    summary: Cloudflare Worker that validates signed B2 Event Notifications and fans them out to subscribers
+    description: Validates signed B2 Event Notifications and fans them out to subscribers; this is where filtering for the manifest key happens, because B2 rules filter by prefix only.
+    architectures: [flight-capture-offload, photogrammetry-processing, ai-inspection-detection]
+
+  - id: cloudflare-b2
+    name: cloudflare-b2 (private bucket via Worker)
+    url: https://github.com/backblaze-b2-samples/cloudflare-b2
+    group: building-block
+    summary: Cloudflare Worker that signs range requests to a private B2 bucket for CDN delivery
+    description: A Worker signs requests to a private B2 bucket and passes range requests through, for CDN delivery of COGs and 3D tilesets without a public bucket.
+    architectures: [cog-map-serving, point-cloud-3d-streaming]
+
+  - id: b2-browser-upload
+    name: B2 Browser Upload
+    url: https://github.com/backblaze-b2-samples/b2-browser-upload
+    group: building-block
+    summary: Browser-direct upload by S3 presigned PUT or b2_upload_file through a Node.js back end (5 GB single-upload cap)
+    description: Browser-direct upload to B2 by S3 presigned PUT or b2_upload_file with keys held server-side; single uploads are capped at 5 GB, so it fits field portals for stills while video needs multipart.
+    architectures: [flight-capture-offload]
+
+  - id: ifcopenshell-bim-archive
+    name: IfcOpenShell BIM Archive
+    url: https://github.com/backblaze-b2-samples/ifcopenshell-bim-archive
+    group: domain
+    summary: IFC models, meshes and reports per project with manifests, served by presigned URL
+    description: IFC models, meshes and reports are archived per project with manifests and served by presigned URL; pairs with construction survey twins for progress comparison.
+    architectures: [point-cloud-3d-streaming]

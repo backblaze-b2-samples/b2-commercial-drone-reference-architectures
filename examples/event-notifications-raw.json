@@ -1,0 +1,20 @@
+{
+  "bucketId": "<raw-bucket-id>",
+  "eventNotificationRules": [
+    {
+      "name": "mission-offload",
+      "eventTypes": [
+        "b2:ObjectCreated:Upload",
+        "b2:ObjectCreated:MultipartUpload"
+      ],
+      "objectNamePrefix": "raw/",
+      "isEnabled": true,
+      "maxEventsPerBatch": 1,
+      "targetConfiguration": {
+        "targetType": "webhook",
+        "url": "https://hooks.example.com/b2/missions",
+        "hmacSha256SigningSecret": "<32-char-alphanumeric-secret>"
+      }
+    }
+  ]
+}

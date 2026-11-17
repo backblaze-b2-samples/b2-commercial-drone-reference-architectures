@@ -1,0 +1,6 @@
+[
+  {"fileNamePrefix": "staging/", "daysFromUploadingToHiding": 14, "daysFromHidingToDeleting": 1, "daysFromStartingToCancelingUnfinishedLargeFiles": 7},
+  {"fileNamePrefix": "query-slices/", "daysFromUploadingToHiding": 30, "daysFromHidingToDeleting": 1, "daysFromStartingToCancelingUnfinishedLargeFiles": 7},
+  {"fileNamePrefix": "edge/", "daysFromUploadingToHiding": 90, "daysFromHidingToDeleting": 1, "daysFromStartingToCancelingUnfinishedLargeFiles": 7},
+  {"fileNamePrefix": "products/", "daysFromUploadingToHiding": null, "daysFromHidingToDeleting": 30, "daysFromStartingToCancelingUnfinishedLargeFiles": 7}
+]
